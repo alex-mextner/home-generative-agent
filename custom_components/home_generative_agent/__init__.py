@@ -149,6 +149,9 @@ from .const import (
     DOMAIN,
     EMBEDDING_MODEL_CTX,
     EMBEDDING_MODEL_DIMS,
+    FALLBACK_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    FALLBACK_CIRCUIT_BREAKER_THRESHOLD,
+    FALLBACK_CIRCUIT_BREAKER_WINDOW_SECONDS,
     FEATURE_CATEGORY_MAP,
     FEATURE_NAMES,
     HGA_CARD_STATIC_PATH,
@@ -225,6 +228,12 @@ from .const import (
     VLM_TOP_P,
 )
 from .core.db_utils import parse_postgres_uri
+from .core.fallback import (
+    CircuitBreaker,
+    FallbackChatModel,
+    FallbackEmbeddings,
+    FallbackVLM,
+)
 from .core.migrations import migrate_person_gallery
 from .core.person_gallery import PersonGalleryDAO
 from .core.runtime import HGAConfigEntry, HGAData
@@ -233,6 +242,7 @@ from .core.subentry_resolver import (
     build_model_deployments,
     legacy_feature_configs,
     legacy_model_provider_configs,
+    resolve_fallback_chains,
     resolve_model_provider_configs,
     resolve_runtime_options,
 )
@@ -1284,6 +1294,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
     conf = dict(options)
     providers = resolve_model_provider_configs(entry, options)
     model_deployments = build_model_deployments(entry, providers, options)
+    fallback_chains = resolve_fallback_chains(entry, providers, options)
+
+    _chat_cb = CircuitBreaker(
+        threshold=FALLBACK_CIRCUIT_BREAKER_THRESHOLD,
+        window_seconds=FALLBACK_CIRCUIT_BREAKER_WINDOW_SECONDS,
+        cooldown_seconds=FALLBACK_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    )
+    _vlm_cb = CircuitBreaker(
+        threshold=FALLBACK_CIRCUIT_BREAKER_THRESHOLD,
+        window_seconds=FALLBACK_CIRCUIT_BREAKER_WINDOW_SECONDS,
+        cooldown_seconds=FALLBACK_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    )
+    _sum_cb = CircuitBreaker(
+        threshold=FALLBACK_CIRCUIT_BREAKER_THRESHOLD,
+        window_seconds=FALLBACK_CIRCUIT_BREAKER_WINDOW_SECONDS,
+        cooldown_seconds=FALLBACK_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    )
+    _emb_cb = CircuitBreaker(
+        threshold=FALLBACK_CIRCUIT_BREAKER_THRESHOLD,
+        window_seconds=FALLBACK_CIRCUIT_BREAKER_WINDOW_SECONDS,
+        cooldown_seconds=FALLBACK_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    )
+
+    def _model_instance_for_provider(provider: Any) -> Any:
+        """Map a ModelProviderConfig to the initialized LangChain instance."""
+        pt = provider.provider_type
+        if pt == "openai":
+            return openai_provider
+        if pt == "openai_compatible":
+            return openai_compatible_provider
+        if pt == "gemini":
+            return gemini_provider
+        if pt == "anthropic":
+            return anthropic_provider
+        if pt == "ollama":
+            settings = provider.data.get("settings", {})
+            url = (
+                settings.get("base_url")
+                or settings.get("chat_url")
+                or settings.get("vlm_url")
+                or settings.get("summarization_url")
+                or RECOMMENDED_OLLAMA_URL
+            )
+            return ollama_providers.get(url)
+        return None
     api_key = conf.get(CONF_API_KEY) or _provider_api_key(providers, "openai")
     openai_secret = SecretStr(api_key) if api_key else None
     gemini_key = conf.get(CONF_GEMINI_API_KEY) or _provider_api_key(providers, "gemini")
@@ -1531,10 +1586,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                 "OpenAI-compatible embeddings init failed; continuing without them."
             )
 
-    # Choose active embedding provider
-    embedding_model: (
-        OpenAIEmbeddings | OllamaEmbeddings | GoogleGenerativeAIEmbeddings | None
-    ) = None
+    # Choose active embedding provider and build fallback chain
+    embedding_model: Any = None
     embedding_provider = options.get(
         CONF_EMBEDDING_MODEL_PROVIDER, RECOMMENDED_EMBEDDING_MODEL_PROVIDER
     )
@@ -1547,6 +1600,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
         embedding_model = gemini_embeddings
     else:
         embedding_model = ollama_embeddings
+
+    # Wrap embedding model with fallback if multiple providers available
+    _emb_fb = fallback_chains.get("embedding", [])
+    if _emb_fb:
+        _emb_chain = [
+            (embedding_model, _emb_fb[0].deployment, _emb_fb[0].entry_id)
+        ]
+        for p in _emb_fb[1:]:
+            m = _model_instance_for_provider(p)
+            if m is not None:
+                _emb_chain.append((m, p.deployment, p.entry_id))
+        if len(_emb_chain) > 1:
+            embedding_model = FallbackEmbeddings(_emb_chain, circuit_breaker=_emb_cb)
+        elif _emb_chain:
+            embedding_model = _emb_chain[0][0]
+        else:
+            embedding_model = None
 
     if embedding_model is None:
         LOGGER.warning(
@@ -1909,6 +1979,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                 }
             }
         )
+
+    # ----- Wrap chat / VLM / summarization with fallback chains -----
+    # Primary model already carries per-feature config (model_name, temp, etc.).
+    # Fallbacks are raw provider instances.
+    _chat_fb = fallback_chains.get("chat", [])
+    if _chat_fb:
+        _chat_chain = [
+            (chat_model, _chat_fb[0].deployment, _chat_fb[0].entry_id)
+        ]
+        for p in _chat_fb[1:]:
+            m = _model_instance_for_provider(p)
+            if m is not None:
+                _chat_chain.append((m, p.deployment, p.entry_id))
+        if len(_chat_chain) > 1:
+            chat_model = FallbackChatModel(_chat_chain, circuit_breaker=_chat_cb)
+
+    _vlm_fb = fallback_chains.get("vlm", [])
+    if _vlm_fb:
+        _vlm_chain = [
+            (vision_model, _vlm_fb[0].deployment, _vlm_fb[0].entry_id)
+        ]
+        for p in _vlm_fb[1:]:
+            m = _model_instance_for_provider(p)
+            if m is not None:
+                _vlm_chain.append((m, p.deployment, p.entry_id))
+        if len(_vlm_chain) > 1:
+            vision_model = FallbackVLM(_vlm_chain, circuit_breaker=_vlm_cb)
+
+    _sum_fb = fallback_chains.get("summarization", [])
+    if _sum_fb:
+        _sum_chain = [
+            (summarization_model, _sum_fb[0].deployment, _sum_fb[0].entry_id)
+        ]
+        for p in _sum_fb[1:]:
+            m = _model_instance_for_provider(p)
+            if m is not None:
+                _sum_chain.append((m, p.deployment, p.entry_id))
+        if len(_sum_chain) > 1:
+            summarization_model = FallbackChatModel(
+                _sum_chain, circuit_breaker=_sum_cb
+            )
 
     video_analyzer = VideoAnalyzer(hass, entry)
     suppression = SuppressionManager(hass)
